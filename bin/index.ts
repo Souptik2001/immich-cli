@@ -1,19 +1,20 @@
 #! /usr/bin/env node
 import axios, { AxiosRequestConfig } from 'axios';
-import { program, Option } from 'commander';
-import * as fs from 'fs';
-import { fdir, PathsOutput } from 'fdir';
-import * as si from 'systeminformation';
-import * as readline from 'readline';
-import * as path from 'path';
-import FormData from 'form-data';
 import * as cliProgress from 'cli-progress';
+import { Option, program } from 'commander';
+import { PathsOutput, fdir } from 'fdir';
+import FormData from 'form-data';
+import * as fs from 'fs';
 import { stat } from 'fs/promises';
+import * as path from 'path';
+import * as readline from 'readline';
+import * as si from 'systeminformation';
 // GLOBAL
-import * as mime from 'mime-types';
 import chalk from 'chalk';
-import pjson from '../package.json';
+import * as mime from 'mime-types';
+import moment from 'moment';
 import pLimit from 'p-limit';
+import pjson from '../package.json';
 
 const log = console.log;
 const rl = readline.createInterface({
@@ -116,7 +117,294 @@ program
     upload(paths, options);
   });
 
+  program
+  .command('delete')
+  .description('Delete assets from an Immich instance')
+  .usage('delete [options] <paths...>')
+  .addOption(new Option('-k, --key <value>', 'API Key').env('IMMICH_API_KEY'))
+  .addOption(
+    new Option(
+      '-s, --server <value>',
+      'Immich server address (http://<your-ip>:2283/api or https://<your-domain>/api)',
+    ).env('IMMICH_SERVER_ADDRESS'),
+  )
+  .addOption(new Option('-y, --yes', 'Assume yes on all interactive prompts').env('IMMICH_ASSUME_YES'))
+  .addOption(
+    new Option('-t, --threads <num>', 'Amount of concurrent upload threads (default=5)').env('IMMICH_UPLOAD_THREADS'),
+  )
+  .addOption(
+    new Option('-al, --album [album]', 'Album\'s image to delete. This will delete images in the specified album only.').env(
+      'IMMICH_DELETE_ALBUMS_IMAGE',
+    ),
+  )
+  .addOption(
+    new Option('-dll, --date_lower_limit [time_lower_limit]', 'Time bucket\'s lower limit').env(
+      'IMMICH_DELETE_ALBUMS_IMAGE',
+    ),
+  )
+  .addOption(
+    new Option('-dul, --date_upper_limit [time_upper_limit]', 'Time bucket\'s upper limit.').env(
+      'IMMICH_DELETE_ALBUMS_IMAGE',
+    ),
+  )
+  .addOption(new Option('-id, --device-uuid <value>', 'Set a device UUID').env('IMMICH_DEVICE_UUID'))
+  .action((options) => {
+    if (options?.album == undefined && options?.date_lower_limit == undefined && options?.date_upper_limit == undefined) {
+      log( chalk.red( "Error: Either specify --all option to delete all assets, or provide one of the following asset: --album, --date_lower_limit, --date_upper_limit" ) );
+      process.exit(1);
+    }
+    delete_assets(options);
+  });
+
 program.parse(process.argv);
+
+async function delete_assets(
+  {
+    key,
+    server,
+    recursive,
+    yes: assumeYes,
+    uploadThreads,
+    album,
+    date_lower_limit: dateLowerLimit,
+    date_upper_limit: dateUpperLimit,
+    deviceUuid: deviceUuid,
+  }: any,
+) {
+  const endpoint = server;
+  const deviceId = deviceUuid || (await si.uuid()).os || 'CLI';
+  const osInfo = (await si.osInfo()).distro;
+
+  const timeLowerLimitEpoch = ( dateLowerLimit == undefined ) ? undefined : Date.parse(dateLowerLimit);
+  const timeUpperLimitEpoch = ( dateUpperLimit == undefined ) ? undefined : Date.parse(dateUpperLimit);
+
+    if ( Number.isNaN( timeLowerLimitEpoch ) || Number.isNaN( timeUpperLimitEpoch ) ) {
+      log(chalk.red(`Invalid date format.`));
+      process.exit(1);
+  }
+
+  // Ping server
+  log('Checking connectivity with Immich instance...');
+  await pingServer(endpoint);
+
+  // Login
+  log('Checking credentials...');
+  const user = await validateConnection(endpoint, key);
+  log(chalk.green(`Successful authentication for user ${user.email}`));
+
+  const assetsToDelete: string[] = [];
+
+  // Get the assets to be deleted.
+  if (album) {
+    const album_info = await get_album_info(key, server, album);
+
+    album_info?.assets.forEach((el: any) => {
+      // Check if the asset is within the desired time bucket.
+      if ( timeLowerLimitEpoch != undefined && timeLowerLimitEpoch > new Date(el.fileCreatedAt).getTime() ) {
+        return;
+      }
+      if ( timeUpperLimitEpoch != undefined && timeUpperLimitEpoch < new Date(el.fileCreatedAt).getTime() ) {
+        return;
+      }
+      assetsToDelete.push( el.id );
+    });
+  } else {
+    const assets_by_time_bucket = await get_assets_by_time_bucket(key, server, dateLowerLimit, dateUpperLimit);
+
+    assets_by_time_bucket.forEach((el: any) => {
+      // Check if the asset is within the desired time bucket.
+      if ( timeLowerLimitEpoch != undefined && timeLowerLimitEpoch > new Date(el.fileCreatedAt).getTime() ) {
+        return;
+      }
+      if ( timeUpperLimitEpoch != undefined && timeUpperLimitEpoch < new Date(el.fileCreatedAt).getTime() ) {
+        return;
+      }
+      assetsToDelete.push( el.id );
+    });
+  }
+
+  log(
+    chalk.green(
+      `A total of ${assetsToDelete.length} assets will be deleted.`
+    ),
+  );
+
+  // Ask user
+  try {
+    //There is a promise API for readline, but it's currently experimental
+    //https://nodejs.org/api/readline.html#promises-api
+    const answer = assumeYes
+      ? 'y'
+      : await new Promise((resolve) => {
+          rl.question('Do you want to start deletion now? (y/n) ', resolve);
+        });
+
+    if (answer == 'n') {
+      log(chalk.yellow('Abort Delete Process'));
+      process.exit(1);
+    }
+
+    if (answer == 'y') {
+      log(chalk.green('Start deleting...'));
+      const progressBar = new cliProgress.SingleBar(
+        {
+          format: 'Delete Progress | {bar} | {percentage}% || {value}/{total}',
+        },
+        cliProgress.Presets.shades_classic,
+      );
+      progressBar.start(Math.ceil(assetsToDelete.length/20), 0);
+
+      const deleteQueue: any[] = [];
+
+      const limit = pLimit(uploadThreads ?? 5);
+
+      var deletePayload: string[] = [];
+
+      assetsToDelete.forEach((asset, index) => {
+        deletePayload.push(asset);
+
+        if (deletePayload.length >= 20 || index >= assetsToDelete.length - 1) {
+          const deletePayloadBatch = deletePayload;
+          deleteQueue.push(
+            limit(async () => {
+              try {
+                const config: AxiosRequestConfig<any> = {
+                  method: 'delete',
+                  maxRedirects: 0,
+                  url: `${server}/asset`,
+                  headers: {
+                    'x-api-key': key,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                  },
+                  data: JSON.stringify({
+                    ids: deletePayloadBatch
+                  }),
+                  maxContentLength: Infinity,
+                  maxBodyLength: Infinity,
+                };
+
+                await axios(config);
+
+                progressBar.increment(1);
+              } catch (err) {
+                log(chalk.red(err.message));
+              }
+            }),
+          );
+
+          deletePayload = [];
+        }
+      });
+
+      await Promise.all(deleteQueue);
+
+      progressBar.stop();
+
+      for (const error of errorAssets) {
+        log("Error asset: ", error)
+      }
+
+      if (errorAssets.length > 0) {
+        process.exit(1);
+      }
+
+      process.exit(0);
+    }
+  } catch (e) {
+    log(chalk.red('Error reading input from user '), e);
+    process.exit(1);
+  }
+}
+
+async function get_assets_by_time_bucket(
+  key: string,
+  server: string,
+  time_lower_limit: string|undefined,
+  time_upper_limit: string|undefined
+) {
+  const timeBucket: string[] = dateRange(time_lower_limit, time_upper_limit);
+
+  let payload = {
+    timeBucket,
+    withoutThumbs: false
+  };
+
+  try {
+    const config: AxiosRequestConfig<any> = {
+      method: 'post',
+      maxRedirects: 0,
+      url: `${server}/asset/time-bucket`,
+      headers: {
+        'x-api-key': key,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      data: JSON.stringify(payload),
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    };
+
+    const res = await axios(config);
+
+    return res.data;
+  } catch (error) {
+    log(chalk.red('Error: Fetching assets by time bucket.'));
+    process.exit(1);
+  }
+}
+
+async function get_album_info(
+  key: string,
+  server: string,
+  album: string
+) {
+  try {
+    const config: AxiosRequestConfig<any> = {
+      method: 'get',
+      maxRedirects: 0,
+      url: `${server}/album/${album}`,
+      headers: {
+        'x-api-key': key,
+        'Accept': 'application/json'
+      },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    };
+
+    const res = await axios(config);
+
+    return res.data;
+  } catch (error) {
+    log(chalk.red('Error: Fetching assets by album.'));
+    process.exit(1);
+  }
+}
+
+function dateRange(
+  startDate: string|undefined,
+  endDate: string|undefined
+) {
+  const startDateEpoch = (startDate == undefined) ? Date.now() : Date.parse(startDate);
+  const endDateEpoch = (endDate == undefined) ? Date.now() : Date.parse(endDate);
+
+  if ( Number.isNaN( startDateEpoch ) || Number.isNaN( endDateEpoch ) ) {
+    log(chalk.red(`Invalid date format.`));
+    process.exit(1);
+}
+
+  let startDateParsed = moment(startDateEpoch);
+  let endDateParsed   = moment(endDateEpoch);
+
+  var dates = [];
+
+  var month = moment(startDateParsed);
+  while( month <= endDateParsed ) {
+      dates.push(new Date(month.format('YYYY-MM-01')).toISOString());
+      month.add(1, "month");
+  }
+  return dates;
+}
 
 async function upload(
   paths: string[],
