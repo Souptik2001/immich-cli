@@ -399,6 +399,12 @@ function dateRange(
   var dates = [];
 
   var month = moment(startDateParsed);
+
+  if ( month > endDateParsed ) {
+    log(chalk.red('Error: Upper limit can\'t be less than lower limit.'))
+    process.exit(1);
+  }
+
   while( month <= endDateParsed ) {
       dates.push(new Date(month.format('YYYY-MM-01')).toISOString());
       month.add(1, "month");
