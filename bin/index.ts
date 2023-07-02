@@ -138,19 +138,24 @@ program
     ),
   )
   .addOption(
-    new Option('-dll, --date_lower_limit [time_lower_limit]', 'Time bucket\'s lower limit').env(
-      'IMMICH_DELETE_ALBUMS_IMAGE',
+    new Option('-d, --date [date]', 'Images of this date will be deleted. If you provided time with the date then 24 hours from that time will be considered.').env(
+      'IMMICH_DELETE_DATE',
     ),
   )
   .addOption(
-    new Option('-dul, --date_upper_limit [time_upper_limit]', 'Time bucket\'s upper limit.').env(
-      'IMMICH_DELETE_ALBUMS_IMAGE',
+    new Option('-dll, --date_lower_limit [date_lower_limit]', 'Time bucket\'s lower limit').env(
+      'IMMICH_DELETE_DATE_LOWER_LIMIT',
+    ),
+  )
+  .addOption(
+    new Option('-dul, --date_upper_limit [date_upper_limit]', 'Time bucket\'s upper limit.').env(
+      'IMMICH_DELETE_DATE_UPPER_LIMIT',
     ),
   )
   .addOption(new Option('-id, --device-uuid <value>', 'Set a device UUID').env('IMMICH_DEVICE_UUID'))
   .action((options) => {
-    if (options?.album == undefined && options?.date_lower_limit == undefined && options?.date_upper_limit == undefined) {
-      log( chalk.red( "Error: Either specify --all option to delete all assets, or provide one of the following asset: --album, --date_lower_limit, --date_upper_limit" ) );
+    if (options?.album == undefined && options?.date_lower_limit == undefined && options?.date_upper_limit == undefined && options?.date == undefined) {
+      log( chalk.red( "Error: Either specify --all option to delete all assets, or provide one of the following asset: --album, -date, --date_lower_limit, --date_upper_limit" ) );
       process.exit(1);
     }
     delete_assets(options);
@@ -166,6 +171,7 @@ async function delete_assets(
     yes: assumeYes,
     threads: uploadThreads,
     album,
+    date: deleteDate,
     date_lower_limit: dateLowerLimit,
     date_upper_limit: dateUpperLimit,
     deviceUuid: deviceUuid,
@@ -175,12 +181,20 @@ async function delete_assets(
   const deviceId = deviceUuid || (await si.uuid()).os || 'CLI';
   const osInfo = (await si.osInfo()).distro;
 
-  const timeLowerLimitEpoch = ( dateLowerLimit == undefined ) ? undefined : Date.parse(dateLowerLimit);
-  const timeUpperLimitEpoch = ( dateUpperLimit == undefined ) ? undefined : Date.parse(dateUpperLimit);
+  let timeLowerLimitEpoch: any = ( dateLowerLimit == undefined ) ? undefined : Date.parse(dateLowerLimit);
+  let timeUpperLimitEpoch: any = ( dateUpperLimit == undefined ) ? undefined : Date.parse(dateUpperLimit);
 
-    if ( Number.isNaN( timeLowerLimitEpoch ) || Number.isNaN( timeUpperLimitEpoch ) ) {
-      log(chalk.red(`Invalid date format.`));
-      process.exit(1);
+  if ( deleteDate != undefined ) {
+    dateLowerLimit = deleteDate;
+    dateUpperLimit = deleteDate;
+    timeLowerLimitEpoch = Date.parse(deleteDate);
+    timeUpperLimitEpoch = new Date(deleteDate);
+    timeUpperLimitEpoch.setUTCHours(timeUpperLimitEpoch.getUTCHours() + 23, timeUpperLimitEpoch.getUTCMinutes() + 59, timeUpperLimitEpoch.getUTCSeconds() + 59);
+  }
+
+  if ( Number.isNaN( timeLowerLimitEpoch ) || Number.isNaN( timeUpperLimitEpoch ) ) {
+    log(chalk.red(`Invalid date format.`));
+    process.exit(1);
   }
 
   // Ping server
@@ -225,9 +239,13 @@ async function delete_assets(
 
   log(
     chalk.green(
-      `A total of ${assetsToDelete.length} assets will be deleted.`
+      `A total of ${assetsToDelete.length} assets found to be deleted.`
     ),
   );
+
+  if ( assetsToDelete.length == 0 ) {
+    process.exit(0);
+  }
 
   // Ask user
   try {
@@ -320,10 +338,10 @@ async function delete_assets(
 async function get_assets_by_time_bucket(
   key: string,
   server: string,
-  time_lower_limit: string|undefined,
-  time_upper_limit: string|undefined
+  timeLowerLimit: string|undefined,
+  timeUpperLimit: string|undefined
 ) {
-  const timeBucket: string[] = dateRange(time_lower_limit, time_upper_limit);
+  const timeBucket: string[] = dateRange(timeLowerLimit, timeUpperLimit);
 
   let payload = {
     timeBucket,
@@ -391,7 +409,7 @@ function dateRange(
   if ( Number.isNaN( startDateEpoch ) || Number.isNaN( endDateEpoch ) ) {
     log(chalk.red(`Invalid date format.`));
     process.exit(1);
-}
+  }
 
   let startDateParsed = moment(startDateEpoch);
   let endDateParsed   = moment(endDateEpoch);
