@@ -164,7 +164,7 @@ async function delete_assets(
     server,
     recursive,
     yes: assumeYes,
-    uploadThreads,
+    threads: uploadThreads,
     album,
     date_lower_limit: dateLowerLimit,
     date_upper_limit: dateUpperLimit,
