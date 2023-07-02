@@ -1,6 +1,6 @@
 {
-  "name": "immich",
-  "version": "0.39.0",
+  "name": "@souptik/immich",
+  "version": "0.41.0",
   "description": "Immich CLI",
   "main": "bin/index.js",
   "scripts": {
